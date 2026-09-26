@@ -26,6 +26,7 @@ use bevy::{
 };
 use bytes::Buf;
 use log::{Level, debug, log_enabled, trace, warn};
+use smallvec::SmallVec;
 
 use crate::{
     postcard_utils,
@@ -782,7 +783,12 @@ fn collect_changes(
     )>,
 ) -> Result<()> {
     replicated_archetypes.update(archetypes, &rules, &receive_markers);
-    let mut clients = ClientSlots::new(&mut clients, &plan, |&(client, ..)| client);
+    let (mut clients, mut client_ticks) =
+        ClientSlots::new(&mut clients, &plan, |item| (item.0, item)).split(
+            |(client, updates, mutations, ticks, priority, visibility)| {
+                ((client, updates, mutations, priority, visibility), ticks)
+            },
+        );
 
     let broadcast = (!plan.explicit).then(|| {
         replicated_archetypes.iter().flat_map(|replicated| {
@@ -814,14 +820,19 @@ fn collect_changes(
         }
         let mut entity_range = None;
         let entity_priority = query.get_priority(entity, archetype.table_id());
-        clients.for_each(recipients, |(_, updates, mutations, ..)| {
+        // Removals have already updated these baselines; only finalization below
+        // mutates them. Borrow each once instead of probing for every component.
+        // Small parties stay inline; larger audiences have no fixed size limit.
+        let mut baselines: SmallVec<[(usize, Option<&EntityTicks>); 8]> = SmallVec::new();
+        for (slot, ticks) in client_ticks.iter(recipients) {
             if let Some(stats) = &mut stats {
                 stats.init_pairs += 1;
             }
+            baselines.push((slot, ticks.entities.get(&entity.id())));
+            let (_, updates, mutations, ..) = clients.get_mut(slot);
             updates.start_entity_changes();
             mutations.start_entity();
-            Ok(())
-        })?;
+        }
 
         for &(rule, storage) in &replicated_archetype.components {
             let (component_index, component_id, fns) = registry.get(rule.fns_id);
@@ -848,105 +859,104 @@ fn collect_changes(
             };
 
             let mut component_range = None;
-            clients.for_each(
-                recipients,
-                |(client, updates, mutations, client_ticks, priority_map, visibility)| {
-                    if let Some(stats) = &mut stats {
-                        stats.component_pairs += 1;
-                    }
-                    let entity_ticks = client_ticks.entities.get(&entity.id());
-                    let existing_component =
-                        entity_ticks.filter(|ticks| ticks.components.contains(component_index));
-                    if let Some(entity_ticks) = existing_component
-                        && (rule.mode == ReplicationMode::Once
-                            || !ticks.is_changed(entity_ticks.system_tick, **change_tick))
-                    {
-                        // Visibility losses were already collected. Keep checking
-                        // against the client's baseline so unacked changes retry.
-                        return Ok(());
-                    }
+            for &(slot, entity_ticks) in &baselines {
+                let (client, updates, mutations, priority_map, visibility) = clients.get_mut(slot);
+                if let Some(stats) = &mut stats {
+                    stats.component_pairs += 1;
+                }
+                let existing_component =
+                    entity_ticks.filter(|ticks| ticks.components.contains(component_index));
+                if let Some(entity_ticks) = existing_component
+                    && (rule.mode == ReplicationMode::Once
+                        || !ticks.is_changed(entity_ticks.system_tick, **change_tick))
+                {
+                    // Visibility losses were already collected. Keep checking
+                    // against the client's baseline so unacked changes retry.
+                    continue;
+                }
 
-                    if let Some(stats) = &mut stats {
-                        stats.visibility_checks += 1;
-                    }
-                    let hidden_lifetime = visibility
-                        .get(entity.id())
-                        .hidden_component_lifetime(&filter_registry, component_index);
-                    if hidden_lifetime == Some(ScopeLifetime::WhileVisible) {
-                        return Ok(());
-                    }
+                if let Some(stats) = &mut stats {
+                    stats.visibility_checks += 1;
+                }
+                let hidden_lifetime = visibility
+                    .get(entity.id())
+                    .hidden_component_lifetime(&filter_registry, component_index);
+                if hidden_lifetime == Some(ScopeLifetime::WhileVisible) {
+                    continue;
+                }
 
-                    let new_for_client = entity_ticks.is_none();
+                let new_for_client = entity_ticks.is_none();
 
-                    if let Some(entity_ticks) = existing_component {
-                        let base_priority = priority_map
-                            .get(&entity.id())
-                            .copied()
-                            .or(entity_priority)
-                            .unwrap_or(1.0);
+                if let Some(entity_ticks) = existing_component {
+                    let base_priority = priority_map
+                        .get(&entity.id())
+                        .copied()
+                        .or(entity_priority)
+                        .unwrap_or(1.0);
 
-                        let tick_diff = **server_tick - entity_ticks.server_tick;
-                        if hidden_lifetime.is_none() && base_priority * tick_diff as f32 >= 1.0 {
-                            trace!(
-                                "writing `{:?}` mutation for `{}` for client `{client}`",
-                                rule.fns_id,
-                                entity.id(),
-                            );
-
-                            if !mutations.entity_added() {
-                                let graph_index = related_entities.graph_index(entity.id());
-                                let entity_range = serialized
-                                    .write_cached_entity(&mut entity_range, entity.id())?;
-                                mutations.add_entity(entity.id(), graph_index, entity_range);
-                            }
-
-                            let diff_cursor = entity_ticks.diff_cursor(component_index);
-                            let component_range = if diff_cursor.is_none() {
-                                // Cache only full component snapshots.
-                                serialized.write_cached_component(
-                                    &mut ctx,
-                                    &mut component_range,
-                                    &mut component,
-                                )?
-                            } else {
-                                ctx.diff_cursor = diff_cursor;
-                                let range = serialized.write_component(&mut ctx, &mut component)?;
-                                if let Some(cursor) = ctx.diff_cursor.take() {
-                                    mutations.add_diff_cursor(component_index, cursor);
-                                }
-                                range
-                            };
-                            mutations.add_component(component_range);
-                        }
-                    } else if hidden_lifetime
-                        .is_none_or(|l| l == ScopeLifetime::AlwaysPresent && new_for_client)
-                    {
+                    let tick_diff = **server_tick - entity_ticks.server_tick;
+                    if hidden_lifetime.is_none() && base_priority * tick_diff as f32 >= 1.0 {
                         trace!(
-                            "writing `{:?}` insertion for `{}` for client `{client}`",
+                            "writing `{:?}` mutation for `{}` for client `{client}`",
                             rule.fns_id,
                             entity.id(),
                         );
 
-                        if !updates.changed_entity_added() {
+                        if !mutations.entity_added() {
+                            let graph_index = related_entities.graph_index(entity.id());
                             let entity_range =
                                 serialized.write_cached_entity(&mut entity_range, entity.id())?;
-                            updates.add_changed_entity(entity_range);
+                            mutations.add_entity(entity.id(), graph_index, entity_range);
                         }
-                        let component_range = serialized.write_cached_component(
-                            &mut ctx,
-                            &mut component_range,
-                            &mut component,
-                        )?;
-                        updates.add_inserted_component(component_range, component_index);
+
+                        let diff_cursor = entity_ticks.diff_cursor(component_index);
+                        let component_range = if diff_cursor.is_none() {
+                            // Cache only full component snapshots.
+                            serialized.write_cached_component(
+                                &mut ctx,
+                                &mut component_range,
+                                &mut component,
+                            )?
+                        } else {
+                            ctx.diff_cursor = diff_cursor;
+                            let range = serialized.write_component(&mut ctx, &mut component)?;
+                            if let Some(cursor) = ctx.diff_cursor.take() {
+                                mutations.add_diff_cursor(component_index, cursor);
+                            }
+                            range
+                        };
+                        mutations.add_component(component_range);
                     }
-                    Ok(())
-                },
-            )?;
+                } else if hidden_lifetime
+                    .is_none_or(|l| l == ScopeLifetime::AlwaysPresent && new_for_client)
+                {
+                    trace!(
+                        "writing `{:?}` insertion for `{}` for client `{client}`",
+                        rule.fns_id,
+                        entity.id(),
+                    );
+
+                    if !updates.changed_entity_added() {
+                        let entity_range =
+                            serialized.write_cached_entity(&mut entity_range, entity.id())?;
+                        updates.add_changed_entity(entity_range);
+                    }
+                    let component_range = serialized.write_cached_component(
+                        &mut ctx,
+                        &mut component_range,
+                        &mut component,
+                    )?;
+                    updates.add_inserted_component(component_range, component_index);
+                }
+            }
         }
 
+        // Release baseline borrows before inserting or advancing entity ticks.
+        drop(baselines);
         clients.for_each(
             recipients,
-            |(client, updates, mutations, ticks, _, visibility)| {
+            |slot, (client, updates, mutations, _, visibility)| {
+                let ticks = client_ticks.get_mut(slot);
                 if let Some(stats) = &mut stats {
                     stats.finalize_pairs += 1;
                     stats.visibility_checks += 1;

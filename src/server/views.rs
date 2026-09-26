@@ -6,7 +6,7 @@ use bevy::{
     ecs::{
         entity::{EntityHashMap, EntityHashSet},
         entity_disabling::Disabled,
-        query::{IterQueryData, QueryData, QueryFilter, QueryItem},
+        query::{IterQueryData, QueryFilter, QueryItem},
     },
     platform::time::Instant,
     prelude::*,
@@ -54,7 +54,7 @@ pub struct CollectionStats {
     pub change_entities: usize,
     /// Replicated components read from authoritative storage.
     pub component_reads: usize,
-    /// Entity-client pairs visited during change initialization.
+    /// Entity-client pairs initialized, each resolving one component-selection baseline.
     pub init_pairs: usize,
     /// Component-client pairs visited during change collection.
     pub component_pairs: usize,
@@ -269,27 +269,28 @@ pub(super) fn for_clients<D: IterQueryData, F: QueryFilter>(
 /// Connections fetched once per collection system. Explicit sends then address
 /// each recipient by plan slot instead of fetching it for every entity and
 /// component.
-pub(super) struct ClientSlots<'q, 's, D: QueryData> {
+pub(super) struct ClientSlots<T> {
     explicit: bool,
-    items: Vec<Option<QueryItem<'q, 's, D>>>,
+    items: Vec<Option<T>>,
 }
 
-impl<'q, 's, D: IterQueryData> ClientSlots<'q, 's, D> {
-    pub(super) fn new<F: QueryFilter>(
+impl<T> ClientSlots<T> {
+    pub(super) fn new<'q, 's, D: IterQueryData, F: QueryFilter>(
         clients: &'q mut Query<'_, 's, D, F>,
         plan: &SendPlan,
-        entity: impl Fn(&QueryItem<'q, 's, D>) -> Entity,
+        mut extract: impl FnMut(QueryItem<'q, 's, D>) -> (Entity, T),
     ) -> Self {
         let mut items = Vec::new();
         if plan.explicit {
             items.resize_with(plan.clients.len(), || None);
             for item in clients.iter_mut() {
-                if let Ok(slot) = plan.clients.binary_search(&entity(&item)) {
+                let (client, item) = extract(item);
+                if let Ok(slot) = plan.clients.binary_search(&client) {
                     items[slot] = Some(item);
                 }
             }
         } else {
-            items.extend(clients.iter_mut().map(Some));
+            items.extend(clients.iter_mut().map(|item| Some(extract(item).1)));
         }
         Self {
             explicit: plan.explicit,
@@ -297,21 +298,80 @@ impl<'q, 's, D: IterQueryData> ClientSlots<'q, 's, D> {
         }
     }
 
+    /// Separates independently borrowed fields while preserving slot alignment.
+    pub(super) fn split<A, B>(
+        self,
+        mut split: impl FnMut(T) -> (A, B),
+    ) -> (ClientSlots<A>, ClientSlots<B>) {
+        let (left, right) = self
+            .items
+            .into_iter()
+            .map(|item| match item {
+                Some(item) => {
+                    let (left, right) = split(item);
+                    (Some(left), Some(right))
+                }
+                None => (None, None),
+            })
+            .unzip();
+        (
+            ClientSlots {
+                explicit: self.explicit,
+                items: left,
+            },
+            ClientSlots {
+                explicit: self.explicit,
+                items: right,
+            },
+        )
+    }
+
+    /// Reads every connection in broadcast mode, otherwise only `recipients`.
+    pub(super) fn iter<'a>(
+        &'a self,
+        recipients: &'a [u32],
+    ) -> impl Iterator<Item = (usize, &'a T)> {
+        let selected = self.explicit.then(|| {
+            recipients.iter().filter_map(|&slot| {
+                self.items[slot as usize]
+                    .as_ref()
+                    .map(|item| (slot as usize, item))
+            })
+        });
+        let broadcast = (!self.explicit).then(|| {
+            self.items
+                .iter()
+                .enumerate()
+                .filter_map(|(slot, item)| item.as_ref().map(|item| (slot, item)))
+        });
+        selected
+            .into_iter()
+            .flatten()
+            .chain(broadcast.into_iter().flatten())
+    }
+
+    /// Accesses a populated slot obtained from this collection or its split half.
+    pub(super) fn get_mut(&mut self, slot: usize) -> &mut T {
+        self.items[slot].as_mut().unwrap()
+    }
+
     /// Visits every connection in broadcast mode, otherwise only `recipients`.
     pub(super) fn for_each(
         &mut self,
         recipients: &[u32],
-        mut f: impl FnMut(&mut QueryItem<'q, 's, D>) -> Result<()>,
+        mut f: impl FnMut(usize, &mut T) -> Result<()>,
     ) -> Result<()> {
         if self.explicit {
             for &slot in recipients {
                 if let Some(item) = &mut self.items[slot as usize] {
-                    f(item)?;
+                    f(slot as usize, item)?;
                 }
             }
         } else {
-            for item in self.items.iter_mut().flatten() {
-                f(item)?;
+            for (slot, item) in self.items.iter_mut().enumerate() {
+                if let Some(item) = item {
+                    f(slot, item)?;
+                }
             }
         }
         Ok(())
