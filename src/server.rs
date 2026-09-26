@@ -853,6 +853,20 @@ fn collect_changes(
                 |(client, updates, mutations, client_ticks, priority_map, visibility)| {
                     if let Some(stats) = &mut stats {
                         stats.component_pairs += 1;
+                    }
+                    let entity_ticks = client_ticks.entities.get(&entity.id());
+                    let existing_component =
+                        entity_ticks.filter(|ticks| ticks.components.contains(component_index));
+                    if let Some(entity_ticks) = existing_component
+                        && (rule.mode == ReplicationMode::Once
+                            || !ticks.is_changed(entity_ticks.system_tick, **change_tick))
+                    {
+                        // Visibility losses were already collected. Keep checking
+                        // against the client's baseline so unacked changes retry.
+                        return Ok(());
+                    }
+
+                    if let Some(stats) = &mut stats {
                         stats.visibility_checks += 1;
                     }
                     let hidden_lifetime = visibility
@@ -862,12 +876,9 @@ fn collect_changes(
                         return Ok(());
                     }
 
-                    let entity_ticks = client_ticks.entities.get(&entity.id());
                     let new_for_client = entity_ticks.is_none();
 
-                    if let Some(entity_ticks) = entity_ticks
-                        && entity_ticks.components.contains(component_index)
-                    {
+                    if let Some(entity_ticks) = existing_component {
                         let base_priority = priority_map
                             .get(&entity.id())
                             .copied()
@@ -875,11 +886,7 @@ fn collect_changes(
                             .unwrap_or(1.0);
 
                         let tick_diff = **server_tick - entity_ticks.server_tick;
-                        if hidden_lifetime.is_none()
-                            && rule.mode != ReplicationMode::Once
-                            && base_priority * tick_diff as f32 >= 1.0
-                            && ticks.is_changed(entity_ticks.system_tick, **change_tick)
-                        {
+                        if hidden_lifetime.is_none() && base_priority * tick_diff as f32 >= 1.0 {
                             trace!(
                                 "writing `{:?}` mutation for `{}` for client `{client}`",
                                 rule.fns_id,
