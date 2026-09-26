@@ -1,6 +1,6 @@
 //! Optional explicit views for sparse server collection.
 
-use core::ops::Range;
+use core::{ops::Range, time::Duration};
 
 use bevy::{
     ecs::{
@@ -8,6 +8,7 @@ use bevy::{
         entity_disabling::Disabled,
         query::{IterQueryData, QueryData, QueryFilter, QueryItem},
     },
+    platform::time::Instant,
     prelude::*,
 };
 
@@ -38,6 +39,38 @@ pub enum ReplicationDomain {
 /// replication eligibility or existing entity and component visibility filters.
 #[derive(Component, Default, Debug, Clone)]
 pub struct ClientView(pub EntityHashSet);
+
+/// Optional counters for the most recent replication collection.
+///
+/// Insert this resource to observe actual collector work. Counters reset at
+/// the beginning of each send; no resource is installed by default.
+#[derive(Resource, Default, Debug, Clone, Copy)]
+pub struct CollectionStats {
+    /// Desired entries inspected, including dead or ineligible entities.
+    pub desired_entries: usize,
+    /// Established baseline entries inspected during view reconciliation.
+    pub baseline_entries: usize,
+    /// Entities visited by component-change collection.
+    pub change_entities: usize,
+    /// Replicated components read from authoritative storage.
+    pub component_reads: usize,
+    /// Entity-client pairs visited during change initialization.
+    pub init_pairs: usize,
+    /// Component-client pairs visited during change collection.
+    pub component_pairs: usize,
+    /// Entity-client pairs visited during change finalization.
+    pub finalize_pairs: usize,
+    /// Cached visibility masks consulted by collection and reconciliation.
+    pub visibility_checks: usize,
+    /// Entity-client pairs visited during mapping collection.
+    pub mapping_pairs: usize,
+    /// Component-client pairs visited during removal collection.
+    pub removal_pairs: usize,
+    /// Entity-client pairs visited while cleaning actual-despawn caches.
+    pub despawn_cleanup_pairs: usize,
+    /// Wall time spent reconciling views and building the send plan.
+    pub plan_time: Duration,
+}
 
 #[derive(Resource, Default)]
 pub(super) struct SendPlan {
@@ -86,6 +119,7 @@ impl SendPlan {
 pub(super) fn prepare_views(
     domain: Res<ReplicationDomain>,
     mut plan: ResMut<SendPlan>,
+    mut stats: Option<ResMut<CollectionStats>>,
     registry: Res<FilterRegistry>,
     mut serialized: ResMut<SerializedData>,
     entities: Query<Has<Replicated>, Allow<Disabled>>,
@@ -101,6 +135,7 @@ pub(super) fn prepare_views(
     >,
     mut departures: Local<Vec<(Entity, bool)>>,
 ) -> Result<()> {
+    let started = stats.is_some().then(Instant::now);
     let SendPlan {
         explicit,
         clients: slots,
@@ -127,6 +162,9 @@ pub(super) fn prepare_views(
         };
         let slot = slots.binary_search(&client).unwrap() as u32;
         for &entity in &view.0 {
+            if let Some(stats) = &mut stats {
+                stats.desired_entries += 1;
+            }
             let entry = *index.entry(entity).or_insert_with(|| {
                 if matches!(entities.get(entity), Ok(true)) {
                     entries.push(PlanEntry {
@@ -161,6 +199,9 @@ pub(super) fn prepare_views(
     for (_, view, mut ticks, mut updates, visibility) in &mut clients {
         departures.clear();
         for &entity in ticks.entities.keys() {
+            if let Some(stats) = &mut stats {
+                stats.baseline_entries += 1;
+            }
             if !view.is_some_and(|view| view.0.contains(&entity)) {
                 // View departure must deliver teardown even when an ordinary
                 // filter hides the entity or it was deleted in this frame.
@@ -177,6 +218,9 @@ pub(super) fn prepare_views(
                 // cached policy needed if it becomes eligible again.
                 departures.push((entity, true));
             } else {
+                if let Some(stats) = &mut stats {
+                    stats.visibility_checks += 1;
+                }
                 // Retained hidden lifetimes deliberately keep stale client
                 // state after authoritative death. WhileVisible still needs
                 // teardown, including a hide and deletion in the same frame.
@@ -194,6 +238,9 @@ pub(super) fn prepare_views(
         }
     }
 
+    if let (Some(stats), Some(started)) = (&mut stats, started) {
+        stats.plan_time = started.elapsed();
+    }
     Ok(())
 }
 

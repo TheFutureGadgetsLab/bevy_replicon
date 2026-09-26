@@ -10,6 +10,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ### Added
 
 - `ReplicationDomain` resource and `ClientView` component. With `ReplicationDomain::Explicit`, the server collects only the entities in each client's view instead of every replicated entity for every client.
+- `CollectionStats` resource. When inserted, it counts the entities, client pairs, and visibility checks the last send visited and times view preparation.
 
 ## [0.44.1] - 2026-09-14
 

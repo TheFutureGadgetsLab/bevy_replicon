@@ -58,7 +58,7 @@ use replication_messages::{
 };
 use replication_query::ReplicationQuery;
 use server_tick::ServerTick;
-use views::{ClientSlots, ReplicationDomain, SendPlan, for_clients};
+use views::{ClientSlots, CollectionStats, ReplicationDomain, SendPlan, for_clients};
 use visibility::client_visibility::ClientVisibility;
 
 pub struct ServerPlugin {
@@ -414,7 +414,11 @@ fn prepare_messages(
     mut related_entities: ResMut<RelatedEntities>,
     mut server_change_tick: ResMut<ServerChangeTick>,
     clients: Query<(&mut Updates, &mut Mutations)>,
+    stats: Option<ResMut<CollectionStats>>,
 ) {
+    if let Some(mut stats) = stats {
+        *stats = CollectionStats::default();
+    }
     **server_change_tick = change_tick.this_run();
     related_entities.rebuild_graphs();
 
@@ -428,6 +432,7 @@ fn prepare_messages(
 fn collect_mappings(
     despawn_buffer: Res<DespawnBuffer>,
     plan: Res<SendPlan>,
+    mut stats: Option<ResMut<CollectionStats>>,
     registry: Res<FilterRegistry>,
     mut serialized: ResMut<SerializedData>,
     entities: Query<(Entity, &Signature), With<Replicated>>,
@@ -464,6 +469,10 @@ fn collect_mappings(
             let Ok((_, mut message, ticks, visibility)) = clients.get_mut(client) else {
                 continue;
             };
+            if let Some(stats) = &mut stats {
+                stats.mapping_pairs += 1;
+                stats.visibility_checks += 1;
+            }
             if should_send_mapping(entity, &despawn_buffer, &registry, &visibility, &ticks) {
                 trace!(
                     "writing mapping `{entity}` to 0x{hash:016x} dedicated for client `{client}`"
@@ -478,6 +487,10 @@ fn collect_mappings(
                 &plan,
                 plan.explicit.then(|| plan.for_entity(entity)),
                 |(client, mut message, ticks, visibility)| {
+                    if let Some(stats) = &mut stats {
+                        stats.mapping_pairs += 1;
+                        stats.visibility_checks += 1;
+                    }
                     if should_send_mapping(entity, &despawn_buffer, &registry, &visibility, &ticks)
                     {
                         trace!("writing mapping `{entity}` to 0x{hash:016x} for client `{client}`");
@@ -518,6 +531,7 @@ fn should_send_mapping(
 fn collect_despawns(
     registry: Res<FilterRegistry>,
     plan: Res<SendPlan>,
+    mut stats: Option<ResMut<CollectionStats>>,
     mut serialized: ResMut<SerializedData>,
     mut despawn_buffer: ResMut<DespawnBuffer>,
     mut clients: Query<(
@@ -534,7 +548,13 @@ fn collect_despawns(
             .then(|| serialized.write_entity(entity))
             .transpose()?;
         for (client, mut message, mut ticks, mut priority, mut visibility) in &mut clients {
+            if let Some(stats) = &mut stats {
+                stats.despawn_cleanup_pairs += 1;
+            }
             if let Some(entity_range) = &entity_range {
+                if let Some(stats) = &mut stats {
+                    stats.visibility_checks += 1;
+                }
                 let hidden_lifetime = visibility.get(entity).hidden_entity_lifetime(&registry);
                 if ticks.entities.remove(&entity).is_some() && hidden_lifetime.is_none() {
                     // Write despawn only if the entity is not currently hidden and was
@@ -551,6 +571,9 @@ fn collect_despawns(
     for (client, mut message, mut ticks, mut priority, visibility) in clients {
         for (entity, filter_mask) in visibility.iter_lost() {
             // Skip visibility changes that hide only components.
+            if let Some(stats) = &mut stats {
+                stats.visibility_checks += 1;
+            }
             if !filter_mask.hides_entity(&registry, ScopeLifetime::WhileVisible) {
                 continue;
             }
@@ -573,6 +596,7 @@ fn collect_despawns(
 fn collect_removals(
     archetypes: &Archetypes,
     plan: Res<SendPlan>,
+    mut stats: Option<ResMut<CollectionStats>>,
     entities: &Entities,
     removal_buffer: Res<RemovalBuffer>,
     rules: Res<ReplicationRules>,
@@ -606,6 +630,10 @@ fn collect_removals(
                 &plan,
                 recipients,
                 |(client, mut message, mut ticks, visibility)| {
+                    if let Some(stats) = &mut stats {
+                        stats.removal_pairs += 1;
+                        stats.visibility_checks += 1;
+                    }
                     let hidden_lifetime = visibility
                         .get(entity)
                         .hidden_component_lifetime(&filter_registry, component_index);
@@ -642,6 +670,9 @@ fn collect_removals(
 
     for (client, mut message, mut ticks, mut visibility) in &mut clients {
         for (entity, filter_mask) in visibility.drain_lost() {
+            if let Some(stats) = &mut stats {
+                stats.visibility_checks += 1;
+            }
             if filter_mask.hides_entity(&filter_registry, ScopeLifetime::WhileVisible) {
                 // Was processed earlier during collecting despawns.
                 continue;
@@ -727,7 +758,7 @@ fn collect_removals(
 /// Collects component changes from this tick into update and mutate messages since the last entity tick.
 fn collect_changes(
     (archetypes, entities): (&Archetypes, &Entities),
-    plan: Res<SendPlan>,
+    (plan, mut stats): (Res<SendPlan>, Option<ResMut<CollectionStats>>),
     query: ReplicationQuery,
     server_tick: Res<ServerTick>,
     change_tick: Res<ServerChangeTick>,
@@ -778,9 +809,15 @@ fn collect_changes(
         .flatten()
         .chain(selected.into_iter().flatten())
     {
+        if let Some(stats) = &mut stats {
+            stats.change_entities += 1;
+        }
         let mut entity_range = None;
         let entity_priority = query.get_priority(entity, archetype.table_id());
         clients.for_each(recipients, |(_, updates, mutations, ..)| {
+            if let Some(stats) = &mut stats {
+                stats.init_pairs += 1;
+            }
             updates.start_entity_changes();
             mutations.start_entity();
             Ok(())
@@ -789,6 +826,9 @@ fn collect_changes(
         for &(rule, storage) in &replicated_archetype.components {
             let (component_index, component_id, fns) = registry.get(rule.fns_id);
 
+            if let Some(stats) = &mut stats {
+                stats.component_reads += 1;
+            }
             // SAFETY: component and storage were obtained from this archetype.
             let (ptr, ticks) = unsafe {
                 query.get_component_unchecked(entity, archetype.table_id(), storage, component_id)
@@ -811,6 +851,10 @@ fn collect_changes(
             clients.for_each(
                 recipients,
                 |(client, updates, mutations, client_ticks, priority_map, visibility)| {
+                    if let Some(stats) = &mut stats {
+                        stats.component_pairs += 1;
+                        stats.visibility_checks += 1;
+                    }
                     let hidden_lifetime = visibility
                         .get(entity.id())
                         .hidden_component_lifetime(&filter_registry, component_index);
@@ -896,6 +940,10 @@ fn collect_changes(
         clients.for_each(
             recipients,
             |(client, updates, mutations, ticks, _, visibility)| {
+                if let Some(stats) = &mut stats {
+                    stats.finalize_pairs += 1;
+                    stats.visibility_checks += 1;
+                }
                 let hidden_lifetime = visibility
                     .get(entity.id())
                     .hidden_entity_lifetime(&filter_registry);
